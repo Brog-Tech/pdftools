@@ -47,7 +47,7 @@ def xsp_detector(
     with init_devices(mock=True):
         xsp = xsp_detector_factory(tmp_path)
 
-    set_mock_value(xsp.hdf.file_path_exists, True)
+    set_mock_value(xsp.hdf.file_path_exists, True)  # pyright: ignore[reportAttributeAccessIssue]
     return xsp
 
 
