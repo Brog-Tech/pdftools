@@ -14,7 +14,7 @@ from ophyd_async.core import (
     init_devices,
     set_mock_value,
 )
-from ophyd_async.epics.adcore import ADBaseDataType
+from ophyd_async.epics.adcore import ADBaseDataType, ADWriterFactory
 
 from pdftools.detectors import XSPIO, XSPBitDepth, XSPDetector
 
@@ -30,9 +30,9 @@ def xsp_io(RE: RunEngine):
 async def xsp_detector_factory():
     def _factory(write_path: Path) -> XSPDetector:
         return XSPDetector(
-            prefix="TEST:XSP",
-            path_provider=StaticPathProvider(
-                StaticFilenameProvider("scan"), write_path
+            "TEST:XSP",
+            ADWriterFactory.hdf(
+                StaticPathProvider(StaticFilenameProvider("scan"), write_path)
             ),
             name="xsp",
         )
@@ -47,7 +47,7 @@ def xsp_detector(
     with init_devices(mock=True):
         xsp = xsp_detector_factory(tmp_path)
 
-    set_mock_value(xsp.writer.file_path_exists, True)
+    set_mock_value(xsp.hdf.file_path_exists, True)
     return xsp
 
 
@@ -65,7 +65,7 @@ async def test_detector_full_stack(RE, xsp_detector_factory, tiled_client, monke
     RE.subscribe(tiled_writer)
     RE.subscribe(lambda name, doc: docs_cache.setdefault(name, []).append(doc))
 
-    set_mock_value(xsp.writer.file_path_exists, True)
+    set_mock_value(xsp.hdf.file_path_exists, True)
     set_mock_value(xsp.driver.array_size_x, 4)
     set_mock_value(xsp.driver.array_size_y, 3)
     set_mock_value(xsp.driver.num_images, 5)
@@ -80,7 +80,7 @@ async def test_detector_full_stack(RE, xsp_detector_factory, tiled_client, monke
                     data=np.random.randint(0, 65536, size=(5, 3, 4), dtype=np.uint16),
                 )
             set_mock_value(xsp.driver.array_counter, 5)
-            set_mock_value(xsp.writer.num_captured, 5)
+            set_mock_value(xsp.hdf.num_captured, 5)
 
     callback_on_mock_put(xsp.driver.acquire, _on_acquire)
 

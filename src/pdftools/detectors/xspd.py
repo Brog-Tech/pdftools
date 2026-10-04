@@ -5,7 +5,6 @@ from typing import Annotated as A
 from ophyd_async.core import (
     DetectorTriggerLogic,
     EnabledDisabled,
-    PathProvider,
     SignalR,
     SignalRW,
     StandardReadable,
@@ -15,10 +14,10 @@ from ophyd_async.core import (
     StandardReadableFormat as Format,
 )
 from ophyd_async.epics.adcore import (
-    ADArmLogic,
+    ADAcquireLogic,
     ADBaseIO,
     ADImageMode,
-    ADWriterType,
+    ADWriterFactory,
     AreaDetector,
     NDPluginBaseIO,
     trigger_info_from_num_images,
@@ -208,7 +207,6 @@ class XSPTriggerLogic(DetectorTriggerLogic):
 
     def config_sigs(self) -> set[SignalR]:
         return {
-            self.driver.acquire_time,
             self.driver.sdk_version,
             self.driver.firmware_version,
             self.driver.ad_core_version,
@@ -234,28 +232,33 @@ class XSPTriggerLogic(DetectorTriggerLogic):
 
 
 class XSPDetector(AreaDetector[XSPIO]):
-    """Create an ADXSPD AreaDetector instance"""
+    """Create an ADXSPD AreaDetector instance
+
+    :param prefix: EPICS PV prefix for the detector
+    :param writer_factories: Factories for file writer plugins and their data logics,
+        e.g. ``ADWriterFactory.hdf(path_provider)``
+    :param driver_suffix: Suffix for the driver PV, defaults to "cam1:"
+    :param plugins: Additional areaDetector plugins to include
+    :param config_sigs: Additional signals to include in configuration
+    :param name: Name for the detector device
+    """
 
     def __init__(
         self,
         prefix: str,
-        path_provider: PathProvider | None = None,
+        *writer_factories: ADWriterFactory,
         driver_suffix="cam1:",
-        writer_type: ADWriterType | None = ADWriterType.HDF,
-        writer_suffix: str | None = None,
         plugins: dict[str, NDPluginBaseIO] | None = None,
         config_sigs: Sequence[SignalR] = (),
         name: str = "",
     ) -> None:
         driver = XSPIO(prefix + driver_suffix)
         super().__init__(
-            prefix=prefix,
-            driver=driver,
-            arm_logic=ADArmLogic(driver),
+            driver,
+            prefix,
+            *writer_factories,
+            acquire_logic=ADAcquireLogic(driver),
             trigger_logic=XSPTriggerLogic(driver),
-            path_provider=path_provider,
-            writer_type=writer_type,
-            writer_suffix=writer_suffix,
             plugins=plugins,
             config_sigs=config_sigs,
             name=name,

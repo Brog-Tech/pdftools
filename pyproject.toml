@@ -14,7 +14,7 @@ classifiers = [
 description = "Importable tools for the PDF beamline at NSLS-II"
 dependencies = [
     "bluesky",
-    "ophyd-async==0.17.0a3",
+    "ophyd-async>=0.21.3",
     "tiled[client]",
 ]
 dynamic = ["version"]
@@ -24,7 +24,7 @@ requires-python = ">=3.11"
 
 [dependency-groups]
 dev = [
-    "ophyd-async[ca, pva, sim]>=0.17a3",
+    "ophyd-async[ca, pva, sim]>=0.21.3",
     "inflection",
     "import-linter",
     "numpydoc",
