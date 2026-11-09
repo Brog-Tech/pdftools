@@ -16,7 +16,6 @@ from ophyd_async.core import (
 from ophyd_async.epics.adcore import (
     ADAcquireLogic,
     ADBaseIO,
-    ADImageMode,
     ADWriterFactory,
     AreaDetector,
     NDPluginBaseIO,
@@ -25,8 +24,6 @@ from ophyd_async.epics.adcore import (
 from ophyd_async.epics.core import (
     EpicsDevice,
     PvSuffix,
-    epics_signal_r,
-    epics_signal_rw_rbv,
 )
 
 
@@ -161,44 +158,57 @@ class XSPModule(EpicsDevice):
 
 
 class XSPIO(StandardReadable, ADBaseIO):
-    def __init__(self, prefix: str, name: str = "") -> None:
-        with self.add_children_as_readables(Format.CONFIG_SIGNAL):
-            self.bit_depth = epics_signal_rw_rbv(XSPBitDepth, prefix + "BitDepth")
-            self.trigger_mode = epics_signal_rw_rbv(
-                XSPTriggerMode, prefix + "TriggerMode"
-            )
-            self.api_version = epics_signal_r(str, prefix + "APIVersion_RBV")
-            self.xspd_version = epics_signal_r(str, prefix + "XSPDVersion_RBV")
-            self.num_modules = epics_signal_r(int, prefix + "NumModules_RBV")
-            self.beam_energy = epics_signal_rw_rbv(float, prefix + "BeamEnergy")
-            self.saturation_flag = epics_signal_rw_rbv(
-                EnabledDisabled, prefix + "SaturationFlag"
-            )
-            self.charge_summing = epics_signal_rw_rbv(
-                EnabledDisabled, prefix + "ChargeSumming"
-            )
-            self.flatfield_correction = epics_signal_rw_rbv(
-                EnabledDisabled, prefix + "FlatFieldCorrection"
-            )
-            self.gating_mode = epics_signal_rw_rbv(
-                EnabledDisabled, prefix + "GatingMode"
-            )
-            self.counter_mode = epics_signal_rw_rbv(
-                XSPCounterMode, prefix + "CounterMode"
-            )
-            self.roi_rows = epics_signal_rw_rbv(XSPROIRows, prefix + "ROIRows")
-            self.low_threshold = epics_signal_rw_rbv(float, prefix + "LowThreshold")
-            self.high_threshold = epics_signal_rw_rbv(float, prefix + "HighThreshold")
-            self.count_rate_correction = epics_signal_rw_rbv(
-                EnabledDisabled, prefix + "CountrateCorrection"
-            )
-            self.compressor = epics_signal_r(XSPCompressor, prefix + "Compressor_RBV")
-            self.sensor_material = epics_signal_r(str, prefix + "SensorMaterial_RBV")
-            self.sensor_thickness = epics_signal_r(
-                float, prefix + "SensorThickness_RBV"
-            )
+    """Driver IO for ADXSPD."""
 
-        super().__init__(prefix, name=name)
+    # XSPD has no Continuous mode; narrow the ADBaseIO hint
+    image_mode: A[SignalRW[XSPImageMode], PvSuffix.rbv("ImageMode")]  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    bit_depth: A[SignalRW[XSPBitDepth], PvSuffix.rbv("BitDepth"), Format.CONFIG_SIGNAL]
+    trigger_mode: A[
+        SignalRW[XSPTriggerMode], PvSuffix.rbv("TriggerMode"), Format.CONFIG_SIGNAL
+    ]
+    api_version: A[SignalR[str], PvSuffix("APIVersion_RBV"), Format.CONFIG_SIGNAL]
+    xspd_version: A[SignalR[str], PvSuffix("XSPDVersion_RBV"), Format.CONFIG_SIGNAL]
+    num_modules: A[SignalR[int], PvSuffix("NumModules_RBV"), Format.CONFIG_SIGNAL]
+    beam_energy: A[SignalRW[float], PvSuffix.rbv("BeamEnergy"), Format.CONFIG_SIGNAL]
+    saturation_flag: A[
+        SignalRW[EnabledDisabled], PvSuffix.rbv("SaturationFlag"), Format.CONFIG_SIGNAL
+    ]
+    charge_summing: A[
+        SignalRW[EnabledDisabled], PvSuffix.rbv("ChargeSumming"), Format.CONFIG_SIGNAL
+    ]
+    flatfield_correction: A[
+        SignalRW[EnabledDisabled],
+        PvSuffix.rbv("FlatFieldCorrection"),
+        Format.CONFIG_SIGNAL,
+    ]
+    gating_mode: A[
+        SignalRW[EnabledDisabled], PvSuffix.rbv("GatingMode"), Format.CONFIG_SIGNAL
+    ]
+    counter_mode: A[
+        SignalRW[XSPCounterMode], PvSuffix.rbv("CounterMode"), Format.CONFIG_SIGNAL
+    ]
+    roi_rows: A[SignalRW[XSPROIRows], PvSuffix.rbv("ROIRows"), Format.CONFIG_SIGNAL]
+    low_threshold: A[
+        SignalRW[float], PvSuffix.rbv("LowThreshold"), Format.CONFIG_SIGNAL
+    ]
+    high_threshold: A[
+        SignalRW[float], PvSuffix.rbv("HighThreshold"), Format.CONFIG_SIGNAL
+    ]
+    count_rate_correction: A[
+        SignalRW[EnabledDisabled],
+        PvSuffix.rbv("CountrateCorrection"),
+        Format.CONFIG_SIGNAL,
+    ]
+    compressor: A[
+        SignalR[XSPCompressor], PvSuffix("Compressor_RBV"), Format.CONFIG_SIGNAL
+    ]
+    sensor_material: A[
+        SignalR[str], PvSuffix("SensorMaterial_RBV"), Format.CONFIG_SIGNAL
+    ]
+    sensor_thickness: A[
+        SignalR[float], PvSuffix("SensorThickness_RBV"), Format.CONFIG_SIGNAL
+    ]
 
 
 class XSPTriggerLogic(DetectorTriggerLogic):
@@ -216,7 +226,7 @@ class XSPTriggerLogic(DetectorTriggerLogic):
         }
 
     async def prepare_internal(self, num: int, livetime: float, deadtime: float):
-        image_mode = ADImageMode.MULTIPLE if num != 1 else ADImageMode.SINGLE
+        image_mode = XSPImageMode.MULTIPLE if num != 1 else XSPImageMode.SINGLE
         coros = [
             self.driver.image_mode.set(image_mode),
             self.driver.num_images.set(num),
