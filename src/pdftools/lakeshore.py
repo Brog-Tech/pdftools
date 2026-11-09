@@ -15,12 +15,14 @@ from ophyd_async.core import (
     StandardMovable,
     StandardReadable,
     StrictEnum,
+    SubsetEnum,
     TimeoutCalculator,
     callback_on_mock_put,
     default_mock_class,
     derived_signal_r,
     set_mock_value,
     soft_signal_rw,
+    wait_for_value,
 )
 from ophyd_async.core import (
     StandardReadableFormat as Format,
@@ -42,7 +44,7 @@ class Lakeshore336LoopMode(StrictEnum):
     WARM = "WARMUP"
 
 
-class Lakeshore336RangeSelect(StrictEnum):
+class Lakeshore336RangeSelect(SubsetEnum):
     OFF = "OFF"
     RANGE1 = "RANGE 1"
     RANGE2 = "RANGE 2"
@@ -54,16 +56,16 @@ class Lakeshore336Resistance(StrictEnum):
     HI50 = "50 OHM"
 
 
-class Lakeshore336LoopInput(StrictEnum):
+class Lakeshore336LoopInput(SubsetEnum):
     NONE = "NONE"
     A = "A"
     B = "B"
     C = "C"
     D = "D"
-    D2 = "D2"
-    D3 = "D3"
-    D4 = "D4"
-    D5 = "D5"
+    # D2 = "D2"
+    # D3 = "D3"
+    # D4 = "D4"
+    # D5 = "D5"
 
 
 ALL_INPUTS = tuple(
@@ -80,7 +82,32 @@ PIDTable = tuple[Sequence[float], Sequence[tuple[float, float, float]]]
 
 
 class Lakeshore336Input(EpicsDevice, StandardReadable):
-    """One Lake Shore 336 temperature input."""
+    """One temperature sensor input (A, B, C or D) on a Lake Shore 336.
+
+    `Lakeshore336` creates one per channel as `input_a`, `input_b`, ...
+    Read `temp` for the temperature in kelvin.
+
+    Signals
+    -------
+    temp
+        Temperature in kelvin (hinted, so it shows in LiveTable/plots).
+    tempc
+        Temperature in degrees Celsius.
+    raw
+        Raw sensor reading (volts or ohms, depending on the sensor type).
+    status
+        Sensor status string from the controller (e.g. reading errors).
+
+    Parameters
+    ----------
+    prefix
+        Full PV prefix for this channel, e.g. ``"XF:28ID1-ES{LS336:1-Chan:A}"``.
+    channel
+        Which input this is. This is the input's own identity and does not
+        change if a control loop is later pointed at a different input.
+    name
+        Device name. Usually set by the parent `Lakeshore336`.
+    """
 
     temp: A[SignalR[float], PvSuffix("T-I"), Format.HINTED_SIGNAL]
     tempc: A[SignalR[float], PvSuffix("T:C-I")]
@@ -94,20 +121,41 @@ class Lakeshore336Input(EpicsDevice, StandardReadable):
         *,
         name: str = "",
     ) -> None:
-        """`channel` is this input's own identity (A, B, C, ...), independent of
-        whichever loop (if any) is currently reading it as a control input."""
         self.channel = channel
         super().__init__(prefix, name=name)
+
+
+def _in_tolerance(
+    readback: SignalR[float], target: SignalR[float], tolerance: SignalR[float]
+) -> SignalR[bool]:
+    """True while `readback` is within `tolerance` of `target`.
+
+    Judged against a local `target` signal rather than the EPICS setpoint, which
+    echoes back over a monitor.
+    """
+
+    def in_tolerance(readback: float, target: float, tolerance: float) -> bool:
+        return isclose(readback, target, rel_tol=0.0, abs_tol=tolerance)
+
+    return derived_signal_r(
+        in_tolerance, readback=readback, target=target, tolerance=tolerance
+    )
 
 
 @dataclass
 class Lakeshore336LoopLogic(MovableLogic[float]):
     """Generic move for a Lake Shore control loop: write the setpoint and wait for
-    the control input to stay within `tolerance` for `settle_time` seconds."""
+    `in_tolerance` to hold for `settle_time` seconds.
 
-    tolerance: SignalR[float]
+    If the move times out and `error_on_move_timeout` is False, a warning is
+    printed and the move finishes without error, so the plan carries on.
+    """
+
+    target: SignalRW[float]
+    in_tolerance: SignalR[bool]
     settle_time: SignalR[float]
     move_timeout: float | None
+    error_on_move_timeout: SignalR[bool]
 
     async def calculate_timeout(
         self,
@@ -116,40 +164,52 @@ class Lakeshore336LoopLogic(MovableLogic[float]):
     ) -> float | None:
         return self.move_timeout
 
-    async def move(self, new_position: float, timeout: TimeoutCalculator) -> None:
-        """Write the setpoint and wait for readback to settle around it."""
-        tolerance, settle_time = await asyncio.gather(
-            self.tolerance.get_value(), self.settle_time.get_value()
-        )
+    async def _stays_in_tolerance(self, settle_time: float) -> bool:
+        """True if `in_tolerance` does not go False during `settle_time`."""
 
-        loop = asyncio.get_running_loop()
-        settled = asyncio.Event()
-        settle_timer: asyncio.TimerHandle | None = None
-
-        def update_settled_state(reading) -> None:
-            nonlocal settle_timer
-            value = reading[self.readback.name]["value"]
-            in_tolerance = isclose(value, new_position, rel_tol=0.0, abs_tol=tolerance)
-
-            if in_tolerance and settle_timer is None:
-                # Start a timer the first time the readback enters tolerance.
-                # It is cancelled below if a later update leaves tolerance.
-                settle_timer = loop.call_later(settle_time, settled.set)
-            elif not in_tolerance and settle_timer is not None:
-                settle_timer.cancel()
-                settle_timer = None
-                settled.clear()
-
-        # Subscribe before writing so that a fast readback update cannot be missed.
-        self.readback.subscribe_reading(update_settled_state)
+        left = asyncio.create_task(wait_for_value(self.in_tolerance, False, None))
         try:
-            await self.setpoint.set(new_position)
-            async with asyncio.timeout(timeout()):
-                await settled.wait()
+            # With a timeout, asyncio.wait returns the unfinished set, not an error.
+            done, _ = await asyncio.wait({left}, timeout=settle_time)
         finally:
-            if settle_timer is not None:
-                settle_timer.cancel()
-            self.readback.clear_sub(update_settled_state)
+            left.cancel()
+        if done:
+            left.result()  # surface a real error from the signal, if any
+            return False
+        return True
+
+    async def move(self, new_position: float, timeout: TimeoutCalculator) -> None:
+        """Write the setpoint and wait for readback to settle around it.
+
+        Raises ``TimeoutError`` on timeout only if `error_on_move_timeout` is
+        True; otherwise prints a warning and returns.
+        """
+        try:
+            await self._move_and_settle(new_position, timeout)
+        except TimeoutError:
+            if await self.error_on_move_timeout.get_value():
+                raise
+            current = await self.readback.get_value()
+            print(
+                f"Warning: timed out moving to {new_position:.4f} "
+                f"(currently {current:.4f}), continuing..."
+            )
+
+    async def _move_and_settle(
+        self, new_position: float, timeout: TimeoutCalculator
+    ) -> None:
+        settle_time = await self.settle_time.get_value()
+
+        # Target first, so in_tolerance judges the new target before the hardware
+        # is told to go there.
+        await self.target.set(new_position)
+        await self.setpoint.set(new_position)
+
+        async with asyncio.timeout(timeout()):
+            while True:
+                await wait_for_value(self.in_tolerance, True, timeout=None)
+                if await self._stays_in_tolerance(settle_time):
+                    return
 
 
 class Lakeshore336LoopMock(DeviceMock["Lakeshore336Loop"]):
@@ -164,11 +224,73 @@ class Lakeshore336LoopMock(DeviceMock["Lakeshore336Loop"]):
 
 @default_mock_class(Lakeshore336LoopMock)
 class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
-    """
-    One heater/control loop.
+    """One heater output / control loop (1-4) on a Lake Shore 336.
 
-    setpoint, PID, heater range, ramp settings, etc. Moving the loop writes the
-    setpoint and settles on the temperature of `loop_input`.
+    Build it with `Lakeshore336.create_loop()` rather than calling this class
+    directly; that checks the loop number and makes sure only one device
+    drives each heater output.
+
+    The loop is movable. ``bps.mv(loop, 300)`` writes 300 K to the setpoint,
+    then waits until the temperature of `loop_input` stays within `tolerance`
+    of 300 K for `settle_time` seconds. If that does not happen within
+    `move_timeout` seconds, the move either raises ``TimeoutError`` or, by
+    default, prints a warning and lets the plan carry on (see
+    `error_on_move_timeout`). ``bps.rd(loop)`` returns the temperature of
+    `loop_input`.
+
+    This class only moves the setpoint. It does not turn the heater on or set
+    PIDs or ramp rates for you. For that, wrap it in a `Cryostat`, or set the
+    signals below yourself.
+
+    Signals
+    -------
+    sp, sprdk
+        Temperature setpoint (K) and its readback from the controller.
+    p, i, d
+        PID gains.
+    ramp, ramp_enbl
+        Setpoint ramp rate (K/min) and whether ramping is on.
+    range
+        Heater range. ``OFF`` means the heater is off.
+    maxi, resistance
+        Heater maximum current (A) and heater resistance setting.
+    enbl, loop_mode
+        Loop on/off and control mode (PID, zone, open loop, ...).
+    loop_in_sel, loop_in_rb
+        The sensor input the controller uses for this loop (set and readback).
+        Call `select_input()` to make the hardware match `loop_input`.
+    autotune
+        Controller autotune mode.
+    tolerance, settle_time
+        Soft signals used to decide when a move has finished. You can change
+        them at any time, e.g. ``bps.mv(loop.tolerance, 0.5)``.
+    error_on_move_timeout
+        Soft signal: whether a move that times out raises ``TimeoutError``
+        (True) or prints a warning and lets the plan carry on (False). Change
+        it at any time with ``bps.mv(loop.error_on_move_timeout, True)``; the
+        new value applies from the next timeout. Recorded as configuration.
+    target, in_tolerance
+        The temperature of the current move and whether `loop_input` is within
+        `tolerance` of it. Used internally by moves.
+
+    Parameters
+    ----------
+    prefix
+        PV prefix for this output, e.g. ``"XF:28ID1-ES{LS336:1-Out:1}"``.
+    loop_input
+        The `Lakeshore336Input` whose temperature this loop controls and
+        settles on. It stays a child of the parent `Lakeshore336`.
+    tolerance
+        Starting value of `tolerance`, in K.
+    settle_time
+        Starting value of `settle_time`, in seconds.
+    move_timeout
+        Seconds a move may take before it times out. ``None`` waits forever.
+    error_on_move_timeout
+        Starting value of `error_on_move_timeout`. Default False (warn and
+        carry on). A `Cryostat` built on this loop uses the same signal.
+    name
+        Device name.
     """
 
     enbl: A[
@@ -241,6 +363,7 @@ class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
         tolerance: float = 0.1,
         settle_time: float = 5.0,
         move_timeout: float | None = 600.0,
+        error_on_move_timeout: bool = False,
         name: str = "",
     ) -> None:
         # Wrapped in Reference so `loop_input` (already a child of the parent
@@ -250,19 +373,28 @@ class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
         with self.add_children_as_readables(Format.CONFIG_SIGNAL):
             self.tolerance = soft_signal_rw(float, initial_value=tolerance)
             self.settle_time = soft_signal_rw(float, initial_value=settle_time)
+            self.error_on_move_timeout = soft_signal_rw(
+                bool, initial_value=error_on_move_timeout
+            )
+        self.target = soft_signal_rw(float, initial_value=0.0)
+        self.in_tolerance = _in_tolerance(loop_input.temp, self.target, self.tolerance)
         super().__init__(prefix, name=name)
 
     @property
     def loop_input(self) -> Lakeshore336Input:
+        """The sensor input this loop controls and settles on."""
         return self._loop_input_ref()
 
     async def select_input(self) -> None:
-        """Point the physical loop's PID input at the channel `loop_input`
-        was constructed with, so the hardware selection matches the Python
-        object graph."""
+        """Tell the controller to use `loop_input` as this loop's sensor.
+
+        The input passed when the loop was built is only known to Python
+        until this is called; the controller may still be using another one.
+        """
         await self.loop_in_sel.set(self.loop_input.channel)
 
     async def get_loop_temp_k(self) -> float:
+        """Return the current temperature of `loop_input`, in kelvin."""
         return await self.loop_input.temp.get_value()
 
     @cached_property
@@ -280,9 +412,11 @@ class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
         return Lakeshore336LoopLogic(
             setpoint=self.sp,
             readback=_mirror(self.loop_input.temp),
-            tolerance=self.tolerance,
+            target=self.target,
+            in_tolerance=self.in_tolerance,
             settle_time=self.settle_time,
             move_timeout=self._move_timeout,
+            error_on_move_timeout=self.error_on_move_timeout,
         )
 
 
@@ -293,12 +427,35 @@ def _mirror(signal: SignalR[float]) -> SignalR[float]:
     return derived_signal_r(temp, temp=signal)
 
 
+# TODO Implement this upstream in nslsii
 class Lakeshore336(StandardReadable):
-    """Lake Shore 336 controller.
+    """A Lake Shore 336 temperature controller.
 
-    Creates its inputs as readable children. Control loops are not children:
-    they are built on demand with `loop()`, so the device that drives a loop
-    (e.g. a `Cryostat`) can own it.
+    The controller's sensor inputs are created as children named `input_a`,
+    `input_b`, ... and all of their temperatures are read when the controller
+    is read (e.g. as a detector in a scan).
+
+    Control loops are not created automatically. Build the one you need with
+    `create_loop()` and hand it to the device that drives it, usually a
+    `Cryostat`, which then owns it::
+
+        lakeshore = Lakeshore336("XF:28ID1-ES{LS336:1", name="lakeshore")
+        cryostat = Cryostat(
+            lakeshore.create_loop(1, lakeshore.input_c, tolerance=1.0),
+            name="cryostat",
+        )
+
+    Parameters
+    ----------
+    prefix
+        PV prefix of the controller without the closing brace, e.g.
+        ``"XF:28ID1-ES{LS336:1"``. Channel and output suffixes such as
+        ``"-Chan:A}"`` and ``"-Out:1}"`` are added to it.
+    inputs
+        Which sensor inputs to create. Defaults to all of A-D. Leave out
+        channels with no sensor so they are not read.
+    name
+        Device name.
     """
 
     # Only the channels passed in `inputs` exist; declared for type checkers.
@@ -333,7 +490,7 @@ class Lakeshore336(StandardReadable):
 
         super().__init__(name=name)
 
-    def loop(
+    def create_loop(
         self,
         number: int,
         loop_input: Lakeshore336Input,
@@ -341,12 +498,49 @@ class Lakeshore336(StandardReadable):
         tolerance: float = 0.1,
         settle_time: float = 5.0,
         move_timeout: float | None = 600.0,
+        error_on_move_timeout: bool = False,
         name: str = "",
     ) -> Lakeshore336Loop:
-        """Build control loop `number` (1-4) closed on `loop_input`.
+        """Create the device for control loop `number`, controlling on `loop_input`.
 
-        Each loop can only be built once, so two devices cannot drive the same
-        heater output.
+        Each loop number can only be created once per controller, so two
+        devices cannot drive the same heater output. Only Python is changed
+        here; nothing is written to the controller until the loop is moved or
+        configured (see `Lakeshore336Loop.select_input` and
+        `Cryostat.configure`).
+
+        Parameters
+        ----------
+        number
+            Heater output / loop number, 1-4.
+        loop_input
+            One of this controller's inputs, e.g. ``lakeshore.input_c``.
+        tolerance
+            How close (K) the temperature must be to the setpoint for a move
+            to count as arrived.
+        settle_time
+            How long (s) the temperature must stay within `tolerance` before
+            a move finishes.
+        move_timeout
+            Seconds a move of the bare loop may take before it fails. ``None``
+            waits forever. A `Cryostat` ignores this and works out its own
+            timeout from the ramp rate.
+        error_on_move_timeout
+            If True, a move that times out raises ``TimeoutError`` and stops
+            the plan. If False (the default) a warning with the target and
+            current temperature is printed and the plan carries on. Applies
+            to the loop and to any `Cryostat` built on it. This is the
+            starting value of the `error_on_move_timeout` soft signal and can
+            be changed later with ``bps.mv(loop.error_on_move_timeout, True)``.
+        name
+            Device name. Leave empty when passing the loop to a `Cryostat`;
+            it is named after the cryostat (e.g. ``"cryostat-loop"``).
+
+        Raises
+        ------
+        ValueError
+            If `number` is not 1-4, the loop was already created, or
+            `loop_input` belongs to a different controller.
         """
         if number not in LOOP_NUMBERS:
             raise ValueError(f"Loop number must be one of {LOOP_NUMBERS}, not {number}")
@@ -361,14 +555,27 @@ class Lakeshore336(StandardReadable):
             tolerance=tolerance,
             settle_time=settle_time,
             move_timeout=move_timeout,
+            error_on_move_timeout=error_on_move_timeout,
             name=name,
         )
 
 
 @dataclass
 class CryostatLogic(Lakeshore336LoopLogic):
-    """Cryostat move: limit-checked, PIDs scheduled from the target temperature and
-    direction of travel, and a timeout calculated from the ramp rate."""
+    """How a `Cryostat` moves.
+
+    On top of `Lakeshore336LoopLogic` it:
+
+    - refuses targets outside ``[min_temp, max_temp]``;
+    - picks PID gains from `heating_pids` or `cooling_pids` by the target
+      temperature and the direction of travel, leaving them unchanged for
+      moves smaller than `pid_deadband`;
+    - works out the timeout from the ramp rate, the settle time and
+      `timeout_buffer`.
+
+    Timeouts are handled by the base class according to `error_on_move_timeout`,
+    which `Cryostat` takes from its loop.
+    """
 
     p: SignalRW[float]
     i: SignalRW[float]
@@ -405,43 +612,103 @@ class CryostatLogic(Lakeshore336LoopLogic):
         old_position: float,
         new_position: float,
     ) -> float:
-        delta = new_position - old_position
-        print(f"Delta = {delta}")
 
-        ramp_rate, settle_time = await asyncio.gather(
-            self.ramp.get_value(),  # perhaps degrees/minute
+        self._old_pos = old_position
+        self._new_pos = new_position
+
+        ramp_rate, settle_time, setpoint = await asyncio.gather(
+            self.ramp.get_value(),  # degrees/minute
             self.settle_time.get_value(),
+            self.setpoint.get_value(),
         )
-        if ramp_rate == 0:
+        if ramp_rate <= 0:
             ramp_rate = self.ramp_fallback
 
-        travel_time = abs(delta) / ramp_rate * 60
+        delta = new_position - old_position
+        spdelta = new_position - setpoint
+        print(f"Delta T = {delta:.2f}")
+        max_delta = max(abs(delta), abs(spdelta))
+
+        travel_time = abs(max_delta) / ramp_rate * 60
         timeout = travel_time + settle_time + self.timeout_buffer
-        print(f"{timeout} Seconds to complete the temp change")
+        print(f"{timeout:.2f} Seconds to complete the temp change")
         return timeout
 
     async def move(self, new_position: float, timeout: TimeoutCalculator) -> None:
+        await self.check_move(new_position)
         original_temp = await self.readback.get_value()
-        print(f"Changing temp from {original_temp} to {new_position}")
+        print(f"Changing temp from {original_temp:.4f} to {new_position:.4f}")
         await self.set_pids(new_position - original_temp, new_position)
         await super().move(new_position, timeout)
 
 
 @default_mock_class(DeviceMock)
 class Cryostat(StandardReadable, StandardMovable[float]):
-    """A cryostat driven by one Lake Shore 336 control loop.
+    """A cryostat whose temperature is controlled by one Lake Shore 336 loop.
 
-    The cryostat owns `loop` (build it with `Lakeshore336.loop()`), and its
-    readback is the temperature of the loop's control input, so `bps.rd(cryostat)`
-    returns the temperature the loop is controlling on.
+    Typical setup::
+
+        lakeshore = Lakeshore336("XF:28ID1-ES{LS336:1", name="lakeshore")
+        cryostat = Cryostat(
+            lakeshore.create_loop(1, lakeshore.input_c, tolerance=1.0, settle_time=10),
+            name="cryostat",
+        )
+        await cryostat.configure()  # once, before the first move
+
+    Each move:
+
+    1. checks the target is within ``[min_temp, max_temp]``;
+    2. sets PID gains from `heating_pids` or `cooling_pids`, unless the move
+       is smaller than `pid_deadband`;
+    3. writes the setpoint and waits until the temperature stays within the
+       loop's `tolerance` for the loop's `settle_time`;
+    4. times out after ``distance / ramp rate + settle_time + timeout_buffer``
+       seconds, where ``distance`` is the larger of the change from the current
+       temperature and the change from the current setpoint.
+
+    `tolerance`, `settle_time` and `error_on_move_timeout` belong to the loop:
+    set their starting values with `Lakeshore336.create_loop()` and change
+    them later with e.g. ``bps.mv(cryostat.loop.error_on_move_timeout, True)``.
+    With `error_on_move_timeout` False (the default) a move that times out
+    prints a warning and the plan carries on; with True it raises
+    ``TimeoutError``. All three are recorded in each scan's configuration.
+
+    Parameters
+    ----------
+    loop
+        The control loop to drive, from `Lakeshore336.create_loop()`. The
+        cryostat takes ownership of it (it becomes ``cryostat.loop``).
+    min_temp, max_temp
+        Allowed target range, in K. Moves outside it raise ``ValueError``.
+    pid_deadband
+        Moves smaller than this (K) keep the current PID gains.
+    heating_pids, cooling_pids
+        PID tables used when heating and cooling. Each is
+        ``(thresholds, pids)`` where ``pids`` has one more entry than
+        ``thresholds``. Targets below ``thresholds[0]`` use ``pids[0]``,
+        targets between ``thresholds[0]`` and ``thresholds[1]`` use
+        ``pids[1]``, and so on.
+    ramp_fallback
+        Ramp rate (K/min) used to work out the timeout when the controller's
+        ramp rate reads 0.
+    timeout_buffer
+        Extra seconds added to every move's timeout.
+    ramp
+        Ramp rate (K/min) written by `configure()`.
+    max_current
+        Heater maximum current (A) written by `configure()`.
+    resistance
+        Heater resistance setting written by `configure()`.
+    heater_range
+        Heater range written by `configure()`, which turns the heater on.
+    name
+        Device name.
     """
 
     def __init__(
         self,
         loop: Lakeshore336Loop,
         *,
-        tolerance: float = 1.0,
-        settle_time: float = 120.0,
         min_temp: float = 5.0,
         max_temp: float = 550.0,
         pid_deadband: float = 0.5,
@@ -480,24 +747,42 @@ class Cryostat(StandardReadable, StandardMovable[float]):
         self._heater_range = heater_range
 
         self.loop = loop
-        with self.add_children_as_readables(Format.CONFIG_SIGNAL):
-            self.tolerance = soft_signal_rw(float, initial_value=tolerance)
-            self.settle_time = soft_signal_rw(float, initial_value=settle_time)
         self.add_readables([self.movable_logic.readback], Format.HINTED_SIGNAL)
-        self.add_readables([loop.sp, loop.sprdk])
+        self.add_readables([loop.sp, loop.sprdk], Format.CONFIG_SIGNAL)
         self.add_readables(
-            [loop.p, loop.i, loop.d, loop.ramp, loop.range, loop.loop_in_rb],
+            [
+                loop.tolerance,
+                loop.settle_time,
+                loop.error_on_move_timeout,
+                loop.p,
+                loop.i,
+                loop.d,
+                loop.ramp,
+                loop.range,
+                loop.loop_in_rb,
+            ],
             Format.CONFIG_SIGNAL,
         )
         super().__init__(name=name)
 
     @property
     def loop_input(self) -> Lakeshore336Input:
+        """The sensor input the cryostat's temperature is read from."""
         return self.loop.loop_input
 
     async def configure(self) -> None:
-        """Set the loop up for closed-loop control on `loop_input` and turn the
-        heater on."""
+        """Set the controller up for this cryostat and turn the heater on.
+
+        Run this once before the first move (``await cryostat.configure()``
+        in IPython). It:
+
+        - sets the setpoint to the current temperature, so nothing moves when
+          the heater comes on;
+        - selects `loop_input` as the loop's sensor;
+        - turns the loop on in PID mode with ramping at `ramp` K/min;
+        - writes the heater maximum current and resistance;
+        - sets the heater range last, which turns the heater on.
+        """
         # Set the loop sp to the current temp so nothing moves irradically.
         curr_temp = await self.loop.get_loop_temp_k()
         await self.loop.sp.set(curr_temp)
@@ -521,8 +806,9 @@ class Cryostat(StandardReadable, StandardMovable[float]):
         return CryostatLogic(
             setpoint=self.loop.sp,
             readback=_mirror(self.loop.loop_input.temp),
-            tolerance=self.tolerance,
-            settle_time=self.settle_time,
+            target=self.loop.target,
+            in_tolerance=self.loop.in_tolerance,
+            settle_time=self.loop.settle_time,
             move_timeout=None,
             p=self.loop.p,
             i=self.loop.i,
@@ -535,4 +821,5 @@ class Cryostat(StandardReadable, StandardMovable[float]):
             cooling_pids=self._cooling_pids,
             ramp_fallback=self._ramp_fallback,
             timeout_buffer=self._timeout_buffer,
+            error_on_move_timeout=self.loop.error_on_move_timeout,
         )
