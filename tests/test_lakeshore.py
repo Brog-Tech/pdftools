@@ -1,7 +1,6 @@
 import asyncio
 
 import pytest
-from bluesky.run_engine import RunEngine
 from ophyd_async.core import (
     callback_on_mock_put,
     get_mock_put,
@@ -19,7 +18,6 @@ from pdftools.lakeshore import (
     Lakeshore336Resistance,
     Lakeshore336Switch,
 )
-from pdftools.plans import t_list
 
 
 @pytest.fixture
@@ -33,7 +31,7 @@ async def ls336() -> Lakeshore336:
 async def cryostat(ls336: Lakeshore336) -> Cryostat:
     async with init_devices(mock=True):
         cryostat = Cryostat(
-            ls336.loop(1, ls336.input_c), settle_time=0.1, name="cryostat"
+            ls336.create_loop(1, ls336.input_c, settle_time=0.1), name="cryostat"
         )
     return cryostat
 
@@ -61,23 +59,23 @@ def test_lakeshore_rejects_none_input():
 
 
 async def test_loop_can_only_be_built_once(ls336: Lakeshore336):
-    ls336.loop(1, ls336.input_c)
+    ls336.create_loop(1, ls336.input_c)
     with pytest.raises(ValueError, match="already been built"):
-        ls336.loop(1, ls336.input_a)
+        ls336.create_loop(1, ls336.input_a)
     # Other loops are still available.
-    ls336.loop(2, ls336.input_a)
+    ls336.create_loop(2, ls336.input_a)
 
 
 async def test_loop_number_and_input_are_validated(ls336: Lakeshore336):
     with pytest.raises(ValueError, match="Loop number"):
-        ls336.loop(5, ls336.input_a)
+        ls336.create_loop(5, ls336.input_a)
     other = Lakeshore336("OTHER:", name="other")
     with pytest.raises(ValueError, match="is not an input of ls336"):
-        ls336.loop(1, other.input_a)
+        ls336.create_loop(1, other.input_a)
 
 
 async def test_loop_prefix(ls336: Lakeshore336):
-    loop = ls336.loop(3, ls336.input_a)
+    loop = ls336.create_loop(3, ls336.input_a)
     assert loop.sp.source == "ca://Test{LS336:1-Out:3}T-SP"
 
 
@@ -102,13 +100,16 @@ async def test_cryostat_readback_is_control_input(
 
     reading = await cryostat.read()
     assert reading["cryostat"]["value"] == 77.0
-    assert set(reading) == {"cryostat", "cryostat-loop-sp", "cryostat-loop-sprdk"}
+    assert set(reading) == {"cryostat"}
     assert cryostat.hints == {"fields": ["cryostat"]}
 
     config = await cryostat.read_configuration()
     assert set(config) == {
-        "cryostat-tolerance",
-        "cryostat-settle_time",
+        "cryostat-loop-tolerance",
+        "cryostat-loop-settle_time",
+        "cryostat-loop-error_on_move_timeout",
+        "cryostat-loop-sp",
+        "cryostat-loop-sprdk",
         "cryostat-loop-p",
         "cryostat-loop-i",
         "cryostat-loop-d",
@@ -120,7 +121,7 @@ async def test_cryostat_readback_is_control_input(
 
 async def test_loop_settles_within_tolerance(ls336: Lakeshore336):
     async with init_devices(mock=True):
-        loop = ls336.loop(2, ls336.input_a, tolerance=0.5, settle_time=0.2)
+        loop = ls336.create_loop(2, ls336.input_a, tolerance=0.5, settle_time=0.2)
     hold_temperature(loop)
     set_mock_value(ls336.input_a.temp, 10.0)
 
@@ -138,12 +139,90 @@ async def test_loop_settles_within_tolerance(ls336: Lakeshore336):
     assert await loop.sp.get_value() == 20.0
 
 
-async def test_loop_times_out(ls336: Lakeshore336):
+async def test_loop_in_tolerance_signal_tracks_target(ls336: Lakeshore336):
     async with init_devices(mock=True):
-        loop = ls336.loop(2, ls336.input_a, move_timeout=0.1)
+        loop = ls336.create_loop(2, ls336.input_a, tolerance=0.5, settle_time=0.05)
+    set_mock_value(loop.target, 20.0)
+    set_mock_value(ls336.input_a.temp, 19.7)
+    assert await loop.in_tolerance.get_value() is True
+    set_mock_value(ls336.input_a.temp, 21.0)
+    assert await loop.in_tolerance.get_value() is False
+    set_mock_value(loop.tolerance, 2.0)  # tolerance changes are followed
+    assert await loop.in_tolerance.get_value() is True
+
+
+async def test_loop_does_not_settle_on_stale_setpoint(ls336: Lakeshore336):
+    """The readback starts in tolerance of the *old* setpoint. The move must be
+    judged against the new target, not report settled straight away."""
+    async with init_devices(mock=True):
+        loop = ls336.create_loop(2, ls336.input_a, tolerance=0.5, settle_time=0.05)
+    hold_temperature(loop)
+    set_mock_value(loop.sp, 10.0)
+    set_mock_value(ls336.input_a.temp, 10.0)
+
+    status = loop.set(50.0)
+    await asyncio.sleep(0.2)  # several settle_times with the readback still at 10
+    assert not status.done
+    assert await loop.in_tolerance.get_value() is False
+
+    set_mock_value(ls336.input_a.temp, 50.1)
+    await status
+
+
+async def test_loop_times_out_when_error_on_move_timeout(ls336: Lakeshore336):
+    async with init_devices(mock=True):
+        loop = ls336.create_loop(
+            2, ls336.input_a, move_timeout=0.1, error_on_move_timeout=True
+        )
     hold_temperature(loop)
     with pytest.raises(TimeoutError):
         await loop.set(20.0)
+
+
+async def test_loop_warns_and_continues_on_timeout_by_default(
+    ls336: Lakeshore336, capsys: pytest.CaptureFixture[str]
+):
+    async with init_devices(mock=True):
+        loop = ls336.create_loop(2, ls336.input_a, move_timeout=0.1)
+    hold_temperature(loop)
+    set_mock_value(ls336.input_a.temp, 5.0)
+    await loop.set(20.0)
+    assert "timed out moving to 20.0000 (currently 5.0000)" in capsys.readouterr().out
+    assert await loop.sp.get_value() == 20.0
+
+
+async def test_error_on_move_timeout_can_be_changed_at_runtime(
+    cryostat: Cryostat,
+):
+    hold_temperature(cryostat.loop)
+    set_mock_value(cryostat.loop_input.temp, 100.0)
+    await cryostat.set(200.0, timeout=0.1)  # default: warn and carry on
+    await cryostat.loop.error_on_move_timeout.set(True)
+    with pytest.raises(TimeoutError):
+        await cryostat.set(250.0, timeout=0.1)
+
+
+@pytest.mark.parametrize("error_on_move_timeout", [True, False])
+async def test_cryostat_error_on_move_timeout(
+    ls336: Lakeshore336, error_on_move_timeout: bool
+):
+    async with init_devices(mock=True):
+        cryostat = Cryostat(
+            ls336.create_loop(
+                1,
+                ls336.input_c,
+                settle_time=0.05,
+                error_on_move_timeout=error_on_move_timeout,
+            ),
+            name="cryostat",
+        )
+    hold_temperature(cryostat.loop)
+    set_mock_value(ls336.input_c.temp, 100.0)
+    if error_on_move_timeout:
+        with pytest.raises(TimeoutError):
+            await cryostat.set(200.0, timeout=0.1)
+    else:
+        await cryostat.set(200.0, timeout=0.1)
 
 
 async def test_cryostat_move(ls336: Lakeshore336, cryostat: Cryostat):
@@ -196,22 +275,51 @@ async def test_cryostat_limits(cryostat: Cryostat, target):
 
 async def test_cryostat_custom_limits(ls336: Lakeshore336):
     async with init_devices(mock=True):
-        cryostat = Cryostat(ls336.loop(2, ls336.input_a), max_temp=300)
+        cryostat = Cryostat(ls336.create_loop(2, ls336.input_a), max_temp=300)
     with pytest.raises(ValueError):
         await cryostat.check_value(301)
 
 
 async def test_cryostat_timeout(cryostat: Cryostat):
     set_mock_value(cryostat.loop.ramp, 6.0)  # K/min
-    # 60 K at 6 K/min = 600 s, plus settle_time (0.1 s) and 30 s buffer.
+    set_mock_value(cryostat.loop.sp, 100.0)
+    # 60 K at 6 K/min = 600 s, plus the loop's settle_time (0.1 s) and 30 s buffer.
     assert await cryostat.movable_logic.calculate_timeout(100, 160) == pytest.approx(
         630.1
     )
 
 
+async def test_cryostat_timeout_uses_farthest_of_readback_and_setpoint(
+    cryostat: Cryostat,
+):
+    set_mock_value(cryostat.loop.ramp, 6.0)
+    set_mock_value(cryostat.loop.sp, 400.0)  # setpoint far from the target
+    # 240 K from the setpoint at 6 K/min = 2400 s, plus 0.1 s settle and 30 s buffer.
+    assert await cryostat.movable_logic.calculate_timeout(100, 160) == pytest.approx(
+        2430.1
+    )
+
+
+async def test_cryostat_uses_loop_settle_and_tolerance(ls336: Lakeshore336):
+    async with init_devices(mock=True):
+        cryostat = Cryostat(
+            ls336.create_loop(2, ls336.input_a, tolerance=0.3, settle_time=7.0),
+            name="cryostat",
+        )
+    logic = cryostat.movable_logic
+    assert logic.settle_time is cryostat.loop.settle_time
+    assert logic.in_tolerance is cryostat.loop.in_tolerance
+    assert logic.target is cryostat.loop.target
+    assert await cryostat.loop.tolerance.get_value() == 0.3
+    set_mock_value(cryostat.loop.ramp, 6.0)
+    set_mock_value(cryostat.loop.sp, 100.0)
+    # 60 K at 6 K/min = 600 s, plus settle_time (7 s) and 30 s buffer.
+    assert await logic.calculate_timeout(100, 160) == pytest.approx(637.0)
+
+
 def test_cryostat_rejects_bad_pid_table():
     ls336 = Lakeshore336("LS:")
-    loop = ls336.loop(1, ls336.input_a)
+    loop = ls336.create_loop(1, ls336.input_a)
     with pytest.raises(ValueError, match="one more PID than thresholds"):
         Cryostat(loop, heating_pids=((100, 200), ((1, 2, 3), (4, 5, 6))))
 
@@ -229,13 +337,3 @@ async def test_cryostat_configure(ls336: Lakeshore336, cryostat: Cryostat):
     assert await loop.maxi.get_value() == 2.0
     assert await loop.resistance.get_value() == Lakeshore336Resistance.LO25
     assert await loop.range.get_value() == Lakeshore336RangeSelect.RANGE3
-
-
-def test_t_list_continues_past_timeouts(RE: RunEngine):
-    with init_devices(mock=True):
-        ls336 = Lakeshore336("LS:", name="ls336")
-        loop = ls336.loop(2, ls336.input_a, move_timeout=0.1)
-    hold_temperature(loop)
-    with pytest.warns(RuntimeWarning, match="did not settle"):
-        RE(t_list(loop, [10.0, 20.0]))
-    assert get_mock_put(loop.sp).call_count == 2
