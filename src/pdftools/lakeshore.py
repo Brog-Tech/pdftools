@@ -184,8 +184,11 @@ class Lakeshore336LoopLogic(MovableLogic[float]):
         Raises ``TimeoutError`` on timeout only if `error_on_move_timeout` is
         True; otherwise prints a warning and returns.
         """
+        await self.target.set(new_position)
+        await self.setpoint.set(new_position)
+
         try:
-            await self._move_and_settle(new_position, timeout)
+            await self._settle(timeout)
         except TimeoutError:
             if await self.error_on_move_timeout.get_value():
                 raise
@@ -195,16 +198,8 @@ class Lakeshore336LoopLogic(MovableLogic[float]):
                 f"(currently {current:.4f}), continuing..."
             )
 
-    async def _move_and_settle(
-        self, new_position: float, timeout: TimeoutCalculator
-    ) -> None:
+    async def _settle(self, timeout: TimeoutCalculator) -> None:
         settle_time = await self.settle_time.get_value()
-
-        # Target first, so in_tolerance judges the new target before the hardware
-        # is told to go there.
-        await self.target.set(new_position)
-        await self.setpoint.set(new_position)
-
         async with asyncio.timeout(timeout()):
             while True:
                 await wait_for_value(self.in_tolerance, True, timeout=None)
@@ -245,7 +240,9 @@ class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
     Signals
     -------
     sp, sprdk
-        Temperature setpoint (K) and its readback from the controller.
+        Temperature setpoint (K) and its readback from the controller. Both are
+        recorded as configuration; the loop's reading is the temperature of
+        `loop_input`.
     p, i, d
         PID gains.
     ramp, ramp_enbl
@@ -299,7 +296,7 @@ class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
 
     sp: A[SignalRW[float], PvSuffix("T-SP"), Format.CONFIG_SIGNAL]
 
-    sprdk: A[SignalR[float], PvSuffix("T-RB"), Format.HINTED_SIGNAL]
+    sprdk: A[SignalR[float], PvSuffix("T-RB"), Format.CONFIG_SIGNAL]
 
     p: A[
         SignalRW[float],
@@ -379,6 +376,7 @@ class Lakeshore336Loop(EpicsDevice, StandardReadable, StandardMovable[float]):
         self.target = soft_signal_rw(float, initial_value=0.0)
         self.in_tolerance = _in_tolerance(loop_input.temp, self.target, self.tolerance)
         super().__init__(prefix, name=name)
+        self.add_readables([self.movable_logic.readback], Format.HINTED_SIGNAL)
 
     @property
     def loop_input(self) -> Lakeshore336Input:
@@ -507,7 +505,7 @@ class Lakeshore336(StandardReadable):
         devices cannot drive the same heater output. Only Python is changed
         here; nothing is written to the controller until the loop is moved or
         configured (see `Lakeshore336Loop.select_input` and
-        `Cryostat.configure`).
+        `pdftools.plans.configure_cryostat`).
 
         Parameters
         ----------
@@ -653,7 +651,7 @@ class Cryostat(StandardReadable, StandardMovable[float]):
             lakeshore.create_loop(1, lakeshore.input_c, tolerance=1.0, settle_time=10),
             name="cryostat",
         )
-        await cryostat.configure()  # once, before the first move
+        RE(configure_cryostat(cryostat))  # once, before the first move
 
     Each move:
 
@@ -694,13 +692,13 @@ class Cryostat(StandardReadable, StandardMovable[float]):
     timeout_buffer
         Extra seconds added to every move's timeout.
     ramp
-        Ramp rate (K/min) written by `configure()`.
+        Ramp rate (K/min) written by `configure_cryostat()`.
     max_current
-        Heater maximum current (A) written by `configure()`.
+        Heater maximum current (A) written by `configure_cryostat()`.
     resistance
-        Heater resistance setting written by `configure()`.
+        Heater resistance setting written by `configure_cryostat()`.
     heater_range
-        Heater range written by `configure()`, which turns the heater on.
+        Heater range written by `configure_cryostat()`, which turns the heater on.
     name
         Device name.
     """
@@ -741,10 +739,10 @@ class Cryostat(StandardReadable, StandardMovable[float]):
         self._cooling_pids = cooling_pids
         self._ramp_fallback = ramp_fallback
         self._timeout_buffer = timeout_buffer
-        self._ramp = ramp
-        self._max_current = max_current
-        self._resistance = resistance
-        self._heater_range = heater_range
+        self.ramp = ramp
+        self.max_current = max_current
+        self.resistance = resistance
+        self.heater_range = heater_range
 
         self.loop = loop
         self.add_readables([self.movable_logic.readback], Format.HINTED_SIGNAL)
@@ -769,37 +767,6 @@ class Cryostat(StandardReadable, StandardMovable[float]):
     def loop_input(self) -> Lakeshore336Input:
         """The sensor input the cryostat's temperature is read from."""
         return self.loop.loop_input
-
-    async def configure(self) -> None:
-        """Set the controller up for this cryostat and turn the heater on.
-
-        Run this once before the first move (``await cryostat.configure()``
-        in IPython). It:
-
-        - sets the setpoint to the current temperature, so nothing moves when
-          the heater comes on;
-        - selects `loop_input` as the loop's sensor;
-        - turns the loop on in PID mode with ramping at `ramp` K/min;
-        - writes the heater maximum current and resistance;
-        - sets the heater range last, which turns the heater on.
-        """
-        # Set the loop sp to the current temp so nothing moves irradically.
-        curr_temp = await self.loop.get_loop_temp_k()
-        await self.loop.sp.set(curr_temp)
-
-        await asyncio.gather(
-            # Set input as defined in object definition
-            self.loop.select_input(),
-            self.loop.ramp_enbl.set(Lakeshore336Switch.ON),
-            self.loop.ramp.set(self._ramp),
-            self.loop.enbl.set(Lakeshore336Switch.ON),
-            self.loop.loop_mode.set(Lakeshore336LoopMode.PID),
-            self.loop.maxi.set(self._max_current),
-            self.loop.resistance.set(self._resistance),
-        )
-
-        # Turn on the heater
-        await self.loop.range.set(self._heater_range)
 
     @cached_property
     def movable_logic(self) -> CryostatLogic:

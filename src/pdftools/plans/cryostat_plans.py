@@ -115,6 +115,43 @@ def set_T(temp_controller: Any, T: float, *, md: dict | None = None) -> Plan:
     return (yield from monitor_temperatures(temp_controller)(plan))
 
 
+def configure_cryostat(cryostat: Cryostat) -> Plan:
+    """Set the controller up for `cryostat` and turn the heater on.
+
+    Run this once before the first move: ``RE(configure_cryostat(cryostat))``.
+    It:
+
+    - sets the setpoint to the current temperature, so nothing moves when the
+      heater comes on;
+    - selects the cryostat's input as the loop's sensor;
+    - turns the loop on in PID mode with ramping at the cryostat's ``ramp``
+      K/min;
+    - writes the heater maximum current and resistance;
+    - sets the heater range last, which turns the heater on.
+    """
+    loop = cryostat.loop
+    curr_temp = yield from bps.rd(cryostat.loop_input.temp)
+    yield from bps.mv(loop.sp, curr_temp)
+    yield from bps.mv(
+        loop.loop_in_sel,
+        loop.loop_input.channel,
+        loop.ramp_enbl,
+        Lakeshore336Switch.ON,
+        loop.ramp,
+        cryostat.ramp,
+        loop.enbl,
+        Lakeshore336Switch.ON,
+        loop.loop_mode,
+        Lakeshore336LoopMode.PID,
+        loop.maxi,
+        cryostat.max_current,
+        loop.resistance,
+        cryostat.resistance,
+    )
+    # Heater on last.
+    yield from bps.mv(loop.range, cryostat.heater_range)
+
+
 def _inputs(lake: Lakeshore336) -> list[tuple[str, Any]]:
     """(channel letter, input device) for each input `lake` has."""
     return [

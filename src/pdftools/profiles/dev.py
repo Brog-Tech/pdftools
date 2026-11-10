@@ -1,11 +1,9 @@
 """PDF-D Bluesky profile for the 28-ID-1 beamline at NSLS-II."""
 
 from bluesky.callbacks.best_effort import BestEffortCallback
-from bluesky.run_engine import RunEngine
+from bluesky.run_engine import RunEngine, autoawait_in_bluesky_event_loop
 from bluesky.utils import ProgressBarManager
 from bluesky_tiled_plugins import TiledWriter
-from IPython.core.getipython import get_ipython
-from IPython.terminal.interactiveshell import TerminalInteractiveShell
 from ophyd_async.core import StaticFilenameProvider, StaticPathProvider, init_devices
 from ophyd_async.epics.adcore import ADWriterFactory
 from tiled.client import simple
@@ -44,10 +42,7 @@ RE.subscribe(tw)
 bec = BestEffortCallback()
 RE.subscribe(bec)
 
-ipython = get_ipython()
-if ipython is not None and isinstance(ipython, TerminalInteractiveShell):
-    ipython.run_line_magic("autoawait", "call_in_bluesky_event_loop")
-
+autoawait_in_bluesky_event_loop()
 
 # path_provider = NSLS2PathProvider(RE.md, beamline_tla="PDF")
 path = "/nsls2/data/pdf/scratch/lambda_testing"
