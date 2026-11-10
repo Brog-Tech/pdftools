@@ -29,7 +29,13 @@ from bluesky.protocols import Readable
 from bluesky.utils import MsgGenerator
 from ophyd_async.core import Device, SignalR
 
-from pdftools.lakeshore import Cryostat, Lakeshore336, Lakeshore336Loop
+from pdftools.lakeshore import (
+    Cryostat,
+    Lakeshore336,
+    Lakeshore336Loop,
+    Lakeshore336LoopMode,
+    Lakeshore336Switch,
+)
 
 Plan = MsgGenerator
 LEGACY_CHANNELS = ("A", "B", "C", "D")
@@ -223,8 +229,10 @@ def Tlist(
 
     Examples
     --------
-    >>> RE(Tlist([lambda1], 30, [100, 150, 200], temp_controller=cryostat))
-    >>> xrun(0, Tlist([pe1c], 30, [100, 150, 200]))  # legacy xpdacq
+    ::
+
+        RE(Tlist([lambda1], 30, [100, 150, 200], temp_controller=cryostat))
+        xrun(0, Tlist([pe1c], 30, [100, 150, 200]))  # legacy xpdacq
     """
     tc = _temp_controller(temp_controller)
     T_list = list(T_list)
@@ -286,7 +294,9 @@ def Tramp(
 
     Examples
     --------
-    >>> RE(Tramp([lambda1], 30, 300, 100, 10, temp_controller=cryostat))
+    ::
+
+        RE(Tramp([lambda1], 30, 300, 100, 10, temp_controller=cryostat))
     """
     if Tstep == 0:
         raise ValueError("Tstep must not be 0")
@@ -346,7 +356,9 @@ def Tramp_continuous(
 
     Examples
     --------
-    >>> RE(Tramp_continuous([lambda1], 10, 100, 300, 2.0, temp_controller=cryostat))
+    ::
+
+        RE(Tramp_continuous([lambda1], 10, 100, 300, 2.0, temp_controller=cryostat))
     """
     tc = _temp_controller(temp_controller)
     if not isinstance(tc, Cryostat):

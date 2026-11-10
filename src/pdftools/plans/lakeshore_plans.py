@@ -81,7 +81,9 @@ def lakeshore_snapshot(
 
     Examples
     --------
-    >>> RE(lakeshore_snapshot(lake, cryostat))
+    ::
+
+        RE(lakeshore_snapshot(lake, cryostat))
     """
     signals = _input_signals(lake)
     for loop in loops:
@@ -129,7 +131,9 @@ def watch_temperatures(
 
     Examples
     --------
-    >>> RE(watch_temperatures(lake, 600, period=5))
+    ::
+
+        RE(watch_temperatures(lake, 600, period=5))
     """
     readables = [inp.temp for _, inp in _inputs(lake)] + list(extra)
     n = max(1, round(duration / period))
@@ -168,7 +172,9 @@ def stability_test(
 
     Examples
     --------
-    >>> RE(stability_test(cryostat, 100, 600))
+    ::
+
+        RE(stability_test(cryostat, 100, 600))
     """
     yield from bps.mv(cryostat, T)
 
@@ -219,7 +225,9 @@ def safe_shutdown(
 
     Examples
     --------
-    >>> RE(safe_shutdown(cryostat, park_T=300))
+    ::
+
+        RE(safe_shutdown(cryostat, park_T=300))
     """
     loop = _as_loop(cryostat)
     if park_T is not None:
