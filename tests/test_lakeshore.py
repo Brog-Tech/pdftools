@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+from bluesky.run_engine import RunEngine
 from ophyd_async.core import (
     callback_on_mock_put,
     get_mock_put,
@@ -18,6 +19,7 @@ from pdftools.lakeshore import (
     Lakeshore336Resistance,
     Lakeshore336Switch,
 )
+from pdftools.plans import configure_cryostat
 
 
 @pytest.fixture
@@ -326,7 +328,8 @@ def test_cryostat_rejects_bad_pid_table():
 
 async def test_cryostat_configure(ls336: Lakeshore336, cryostat: Cryostat):
     set_mock_value(ls336.input_c.temp, 42.0)
-    await cryostat.configure()
+    RE = RunEngine({})
+    RE(configure_cryostat(cryostat))
     loop = cryostat.loop
     assert await loop.sp.get_value() == 42.0
     assert await loop.loop_in_sel.get_value() == Lakeshore336LoopInput.C
@@ -337,3 +340,15 @@ async def test_cryostat_configure(ls336: Lakeshore336, cryostat: Cryostat):
     assert await loop.maxi.get_value() == 2.0
     assert await loop.resistance.get_value() == Lakeshore336Resistance.LO25
     assert await loop.range.get_value() == Lakeshore336RangeSelect.RANGE3
+
+
+async def test_loop_reading_is_sensor_temperature(ls336: Lakeshore336):
+    async with init_devices(mock=True):
+        loop = ls336.create_loop(3, ls336.input_b, name="loop")
+    set_mock_value(ls336.input_b.temp, 55.0)
+    set_mock_value(loop.sprdk, 99.0)
+
+    reading = await loop.read()
+    assert reading["loop"]["value"] == 55.0
+    assert loop.hints == {"fields": ["loop"]}
+    assert "loop-sprdk" in await loop.read_configuration()
